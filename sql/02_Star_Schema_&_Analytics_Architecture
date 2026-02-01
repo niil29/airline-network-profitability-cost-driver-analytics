@@ -1,0 +1,401 @@
+-- CREATE AND INSERT DATA INTO DATE DIMENSION TABLE
+
+DROP TABLE IF EXISTS dim_date;
+GO
+
+CREATE TABLE dim_date (
+	date_key DATE PRIMARY KEY,
+	year INT,
+	quarter INT,
+	month INT,
+	month_name VARCHAR(20),
+	year_month CHAR(7),
+	is_covid_period BIT
+);
+GO
+
+INSERT INTO dim_date (
+	date_key,
+	year,
+	quarter,
+	month,
+	month_name,
+	year_month,
+	is_covid_period
+)
+SELECT DISTINCT report_month_date,
+	year,
+	quarter,
+	month,
+	DATENAME(MONTH,report_month_date),
+	FORMAT(report_month_date,'yyyy-MM'),
+	CASE WHEN report_month_date BETWEEN '2020-03-01' AND '2021-12-01'
+		THEN 1 ELSE 0
+		END
+FROM stg_airline_operations
+;
+
+SELECT TOP(100) *
+FROM stg_airline_operations
+;
+
+-- CREATE AND INSERT DATA INTO CARRIER DIMENSION TABLE
+
+DROP TABLE IF EXISTS dim_carrier;
+GO
+
+CREATE TABLE dim_carrier (
+	carrier_key INT IDENTITY PRIMARY KEY,
+	unique_carrier VARCHAR(10),
+	airline_id INT,
+	carrier_name VARCHAR(200),
+	carrier_group INT,
+	carrier_gruop_new INT,
+	region CHAR(1)
+);
+
+TRUNCATE TABLE dim_carrier;
+GO
+
+WITH ranked_carriers AS (
+	SELECT unique_carrier,
+		airline_id,
+		unique_carrier_name AS carrier_name,
+		carrier_group,
+		carrier_group_new,
+		region,
+		ROW_NUMBER() OVER(PARTITION BY unique_carrier ORDER BY
+														CASE WHEN unique_carrier_name IS NOT NULL THEN 0 ELSE 1 END, airline_id) AS rn
+	FROM stg_airline_operations
+	WHERE unique_carrier IS NOT NULL
+)
+
+INSERT INTO dim_carrier (
+	unique_carrier,
+	airline_id,
+	carrier_name,
+	carrier_group,
+	carrier_gruop_new,
+	region
+)
+SELECT DISTINCT unique_carrier,
+	airline_id,
+	carrier_name,
+	carrier_group,
+	carrier_group_new,
+	region
+FROM ranked_carriers
+WHERE rn = 1
+;
+GO
+
+SELECT DISTINCT unique_carrier
+FROM stg_airline_operations
+WHERE unique_carrier IS NOT NULL
+;
+
+SELECT COUNT(*)
+FROM dim_carrier
+;
+
+
+SELECT TOP 50 *
+FROM stg_airline_operations
+;
+
+
+-- CREATE AND INSERT DATA INTO GEOGRAPHY DIMENSION TABLE
+
+DROP TABLE IF EXISTS dim_geography;
+GO
+
+CREATE TABLE dim_geography (
+	geography_key INT IDENTITY PRIMARY KEY,
+	city_market_id INT,
+	city_name VARCHAR(200),
+	state_abr CHAR(2),
+	state_fips INT,
+	state_name VARCHAR(100),
+	region VARCHAR(50),
+	wac INT
+);
+GO
+
+INSERT INTO dim_geography (
+	city_market_id,
+	city_name,
+	state_abr,
+	state_fips,
+	state_name,
+	region,
+	wac
+)
+SELECT DISTINCT
+		origin_city_market_id,
+		origin_city_name,
+		origin_state_abr,
+		origin_state_fips,
+		origin_state_nm,
+		region,
+		origin_wac
+FROM stg_airline_operations
+UNION ALL
+
+SELECT DISTINCT
+		dest_city_market_id,
+		dest_city_name,
+		dest_state_abr,
+		dest_state_fips,
+		dest_state_nm,
+		region,
+		dest_wac
+FROM stg_airline_operations;
+GO
+
+-- CREATE AND INSERT DATA INTO ROUTE DIMENSION TABLE
+
+DROP TABLE IF EXISTS dim_route;
+GO
+
+CREATE TABLE dim_route (
+	route_key INT IDENTITY PRIMARY KEY,
+	origin_airport CHAR(3),
+	origin_geo_key INT,
+	dest_airport CHAR(3),
+	dest_geo_key INT,
+	distance FLOAT,
+
+	CONSTRAINT fk_route_origin_geo
+		FOREIGN KEY (origin_geo_key) REFERENCES dim_geography (geography_key),
+	CONSTRAINT fk_route_dest_geo
+		FOREIGN KEY (dest_geo_key) REFERENCES dim_geography (geography_key),
+);
+GO
+
+-- CREATE INDEXES
+
+CREATE INDEX ix_stg_origin_city
+ON stg_airline_operations (origin_city_market_id);
+CREATE INDEX ix_stg_dest_city
+ON stg_airline_operations (dest_city_market_id);
+CREATE INDEX ix_geo_city_market
+ON dim_geography (city_market_id);
+
+TRUNCATE TABLE dim_route;
+GO
+
+WITH ranked_routes AS (
+	SELECT 	s.origin,
+			s.dest,
+			s.distance,
+			g1.geography_key AS origin_geo_key,
+			g2.geography_key AS dest_geo_key,
+			ROW_NUMBER() OVER(PARTITION BY s.origin, s.dest ORDER BY s.distance) AS rn
+	FROM stg_airline_operations s
+	JOIN dim_geography g1
+		ON s.origin_city_market_id = g1.city_market_id
+	JOIN dim_geography g2
+		ON s.dest_city_market_id = g2.city_market_id
+)
+
+INSERT INTO dim_route (
+	origin_airport,
+	origin_geo_key,
+	dest_airport,
+	dest_geo_key,
+	distance
+)
+SELECT origin,
+		origin_geo_key,
+		dest,
+		dest_geo_key,
+		distance
+FROM ranked_routes
+WHERE rn = 1
+;
+GO
+
+
+-- CREATE AND INSERT DATA INTO FACT AIRLINE OPERATIONS TABLE
+
+DROP TABLE IF EXISTS fact_airline_operations;
+GO
+
+CREATE TABLE fact_airline_operations (
+	date_key DATE,
+	carrier_key INT,
+	route_key INT,
+
+	passengers FLOAT,
+	freight FLOAT,
+	mail FLOAT,
+
+	CONSTRAINT fk_fact_date
+		FOREIGN KEY (date_key) REFERENCES dim_date (date_key),
+	CONSTRAINT fk_fact_carrier
+		FOREIGN KEY (carrier_key) REFERENCES dim_carrier (carrier_key),
+	CONSTRAINT fk_fact_route
+		FOREIGN KEY (route_key) REFERENCES dim_route (route_key),
+);
+GO
+
+-- CREATE INDEXES 
+
+CREATE INDEX ix_stg_fact_group
+ON stg_airline_operations (
+		report_month_date,
+		unique_carrier,
+		origin,
+		dest
+);
+
+CREATE UNIQUE INDEX ux_dim_carrier_code
+ON dim_carrier (unique_carrier)
+WHERE unique_carrier IS NOT NULL;
+
+--SELECT unique_carrier, COUNT(*)
+--FROM dim_carrier
+--GROUP BY unique_carrier
+--ORDER BY 2 DESC;
+
+
+CREATE UNIQUE INDEX ux_dim_route_lookup
+ON dim_route (
+	origin_airport,
+	dest_airport,
+	distance
+	)
+
+TRUNCATE TABLE fact_airline_operations;
+GO
+
+WITH fact_base AS (
+	SELECT report_month_date,
+			unique_carrier,
+			origin,
+			dest,
+			distance,
+
+			SUM(passengers) AS passengers,
+			SUM(freight) AS freight,
+			SUM(mail) AS mail
+	FROM stg_airline_operations
+	GROUP BY report_month_date,
+			unique_carrier,
+			origin,
+			dest,
+			distance
+)
+INSERT INTO fact_airline_operations (
+	date_key, 
+	carrier_key,
+	route_key,
+	passengers,
+	freight,
+	mail
+)
+SELECT fb.report_month_date,
+		c.carrier_key,
+		r.route_key,
+		fb.passengers,
+		fb.freight,
+		fb.mail
+FROM fact_base fb
+JOIN dim_carrier c
+	ON fb.unique_carrier = c.unique_carrier
+JOIN dim_route r
+	ON fb.origin = r.origin_airport
+	AND fb.dest = r.dest_airport
+	AND fb.distance = r.distance
+;
+GO
+
+SELECT TOP 100 *
+FROM fact_airline_operations
+;
+
+--	SANITY CHECKS
+
+-- ROW COUNT
+
+SELECT 'dim_date' AS table_name, COUNT(*) AS row_count FROM dim_date
+UNION ALL
+SELECT 'dim_carrier', COUNT(*)  FROM dim_carrier
+UNION ALL
+SELECT 'dim_geography', COUNT(*)  FROM dim_geography
+UNION ALL
+SELECT 'dim_route', COUNT(*)  FROM dim_route
+UNION ALL
+SELECT 'fact_airline_operations', COUNT(*)  FROM fact_airline_operations
+;
+
+
+-- REFERENTIAL INTEGRITY CHECKS
+
+SELECT COUNT(*) AS orphan_carriers
+FROM fact_airline_operations f
+LEFT JOIN dim_carrier c
+	ON f.carrier_key = c.carrier_key
+WHERE c.carrier_key IS NULL
+;
+
+
+SELECT COUNT(*) AS orphan_routes
+FROM fact_airline_operations f
+LEFT JOIN dim_route r
+	ON f.route_key = r.route_key
+WHERE r.route_key IS NULL
+;
+
+
+SELECT COUNT(*) AS orphan_dates
+FROM fact_airline_operations f
+LEFT JOIN dim_date d
+	ON f.date_key = d.date_key
+WHERE d.date_key IS NULL
+;
+
+
+-- GRAIN VALIDATION
+
+SELECT carrier_key,
+		route_key,
+		date_key,
+		COUNT(*) AS row_count
+FROM fact_airline_operations
+GROUP BY carrier_key,
+		route_key,
+		date_key
+HAVING COUNT(*) > 1
+;
+
+-- MATRICS SANITY CHECKS
+
+SELECT MIN(passengers) AS min_pax,
+		MAX(passengers) AS max_pax,
+		SUM(passengers) AS total_pax
+FROM fact_airline_operations
+;
+
+SELECT TOP 10
+		origin_airport,
+		dest_airport,
+		distance
+FROM dim_route
+ORDER BY distance DESC
+;
+
+SELECT MIN(date_key) AS min_date,
+		MAX(date_key) AS max_date,
+		COUNT(DISTINCT date_key) AS total_date
+FROM fact_airline_operations
+;
+
+SELECT c.unique_carrier,
+		COUNT(*) AS fact_rows
+FROM fact_airline_operations f
+JOIN dim_carrier c
+	ON f.carrier_key = c.carrier_key
+GROUP BY c.unique_carrier
+ORDER BY fact_rows DESC
+;
