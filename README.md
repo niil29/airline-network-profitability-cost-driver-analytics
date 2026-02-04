@@ -22,6 +22,13 @@ This project answers:
 
 ---
 
+## 📥 Data Source
+
+The analysis is based on publicly available airline operational data sourced from the  
+**U.S. Bureau of Transportation Statistics (BTS)**.
+
+---
+
 ## 🧩 Data & Modeling Assumptions
 - One row represents **Carrier × Route × Month**
 - No flight-level or flight-count data available
